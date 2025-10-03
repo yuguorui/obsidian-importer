@@ -1,6 +1,7 @@
 import { OnenotePage, SectionGroup, User, PublicError, Notebook, OnenoteSection } from '@microsoft/microsoft-graph-types';
 import { DataWriteOptions, Notice, Setting, TFolder, htmlToMarkdown, ObsidianProtocolData, requestUrl, moment } from 'obsidian';
 import { genUid, parseHTML } from '../util';
+import { parseFilePath } from '../filesystem';
 import { FormatImporter } from '../format-importer';
 import { ATTACHMENT_EXTS, AUTH_REDIRECT_URI, ImportContext } from '../main';
 import { AccessTokenResponse } from './onenote/models';
@@ -538,6 +539,7 @@ export class OneNoteImporter extends FormatImporter {
 
 	async processFile(progress: ImportContext, content: string, page: OnenotePage) {
 		try {
+			console.log(content);
 			const splitContent = this.convertFormat(content);
 			const outputFolder = await this.getOutputFolder();
 			const outputPath = this.getEntityPathNoParent(page.id!, outputFolder!.name)!;
@@ -548,7 +550,7 @@ export class OneNoteImporter extends FormatImporter {
 
 
 			let taggedPage = this.convertTags(parseHTML(splitContent.html));
-			let html = await this.getAllAttachments(progress, taggedPage.replace(PARAGRAPH_REGEX, '<br />'));
+			let html = await this.getAllAttachments(progress, taggedPage.replace(PARAGRAPH_REGEX, '<br />'), pageFolder);
 			this.combineCodeBlocksAsNecessary(html);
 			this.styledElementToHTML(html);
 			this.convertInternalLinks(html);
@@ -761,7 +763,7 @@ export class OneNoteImporter extends FormatImporter {
 	}
 
 	// Download all attachments and add embedding syntax for supported file formats.
-	async getAllAttachments(progress: ImportContext, pageHTML: string): Promise<HTMLElement> {
+	async getAllAttachments(progress: ImportContext, pageHTML: string, pageFolder: TFolder): Promise<HTMLElement> {
 		const pageElement = parseHTML(pageHTML.replace(SELF_CLOSING_REGEX, '<$1$2></$1>'));
 
 		const objects: HTMLElement[] = pageElement.findAll('object');
@@ -786,7 +788,7 @@ export class OneNoteImporter extends FormatImporter {
 			else {
 				const originalName = object.getAttribute('data-attachment')!;
 				const contentLocation = object.getAttribute('data')!;
-				const filename = await this.fetchAttachment(progress, originalName, contentLocation);
+				const filename = await this.fetchAttachment(progress, originalName, contentLocation, pageFolder);
 
 				// Create a new <p> element with the Markdown-style link
 				const markdownLink = document.createElement('p');
@@ -802,9 +804,9 @@ export class OneNoteImporter extends FormatImporter {
 			let split: string[] = image.getAttribute('data-fullres-src-type')!.split('/');
 			const extension: string = split[1];
 			const currentDate = moment().format('YYYYMMDDHHmmss');
-			const fileName: string = `Exported image ${currentDate}-${i}.${extension}`;
+			const fileName: string = `image-${currentDate}-${i}.${extension}`;
 			const contentLocation = image.getAttribute('data-fullres-src')!;
-			const outputPath = await this.fetchAttachment(progress, fileName, contentLocation);
+			const outputPath = await this.fetchAttachment(progress, fileName, contentLocation, pageFolder);
 			if (outputPath) {
 				image.src = encodeURI(outputPath);
 				if (!image.alt || BASE64_REGEX.test(image.alt)) {
@@ -834,7 +836,7 @@ export class OneNoteImporter extends FormatImporter {
 		return pageElement;
 	}
 
-	async fetchAttachment(progress: ImportContext, filename: string, contentLocation: string) {
+	async fetchAttachment(progress: ImportContext, filename: string, contentLocation: string, pageFolder: TFolder) {
 		// Every 7 attachments, do a few second break to prevent rate limiting
 		if (this.attachmentDownloadPauseCounter === 7) {
 			await new Promise(resolve => {
@@ -848,16 +850,25 @@ export class OneNoteImporter extends FormatImporter {
 		progress.status('Downloading attachment ' + filename);
 
 		try {
-			// We don't need to remember claimedPaths because we're writing the attachments immediately.
-			const outputPath = await this.getAvailablePathForAttachment(filename, []);
+			const attachmentDirName = 'Attachments';
 			const data = (await this.fetchResource(contentLocation, 'file', progress));
-			await this.app.vault.createBinary(outputPath, data);
+			let outputPath: string;
+			// Create an attachments subfolder within the page folder, similar to html.ts
+			const attachmentsFolder = await this.createFolders(`${pageFolder.path}/${attachmentDirName}`);
+			const { basename, extension } = parseFilePath(filename);
+
+			// @ts-ignore
+			outputPath = await this.vault.getAvailablePath(`${attachmentsFolder.path}/${basename}`, extension);
+
+			const file = await this.vault.createBinary(outputPath, data);
 			progress.reportAttachmentSuccess(filename);
-			return outputPath;
+			return `${attachmentDirName}/${file.name}`;
 		}
 		catch (e) {
-			progress.reportFailed(filename);
-			console.error(e);
+			const errorMsg = e instanceof Error ? e.message : String(e);
+			progress.reportFailed(filename, errorMsg);
+			console.error('Failed to download attachment:', filename, e);
+			return null;
 		}
 	}
 
